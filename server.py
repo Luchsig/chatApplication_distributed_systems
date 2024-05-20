@@ -209,57 +209,83 @@ class Server:
                 leader_thread.start()
 
     # ------------ DATA REPLICATION BETWEEN SERVERS ------------
+
     def handle_leader_update(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_socket.bind((IP_ADDRESS, MULTICAST_PORT_SERVER))
         group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
-        mreq = struct.pack('4sL', group, MULTICAST_TTL, MULTICAST_PORT_SERVER)
+        mreq = struct.pack('4sL', group, socket.INADDR_ANY)
         server_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-        while not self.shutdown_event.is_set():
-            if not self.is_leader:
-                data, addr = server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
-                if addr == self.leader_ip_address:
-                    data = json.loads(data.decode())
-                    self.list_of_known_users = data['known_users']
-                    self.chat_rooms = data['chat_rooms']
+
+        try:
+            server_socket.settimeout(1)
+            while not self.shutdown_event.is_set():
+                if not self.is_leader:
+                    data, addr = server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
+                    if addr == self.leader_ip_address:
+                        data = json.loads(data.decode())
+                        self.chat_rooms = data.get('chat_rooms', self.chat_rooms)
+        except Exception as e:
+            print(f"Error in handle_leader_update: {e}")
+        finally:
+            server_socket.close()
 
     def send_leader_update(self):
-        # TODO: MUSS udp multicast verwenden und die entsprechende Adresse
         if self.is_leader:
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             client_socket.bind((IP_ADDRESS, MULTICAST_PORT_SERVER))
 
             group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
-            mreq = struct.pack('4sL', group, MULTICAST_TTL, MULTICAST_PORT_SERVER)
+            mreq = struct.pack('4sL', group, socket.INADDR_ANY)
             client_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-            message = json.dumps({"known_users": self.list_of_known_users, "chat_rooms": self.chat_rooms}).encode()
-            for server in self.list_of_known_users:
-                client_socket.sendto(message, server)
+            message = json.dumps({"chat_rooms": self.chat_rooms}).encode()
+
+            client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, MULTICAST_PORT_SERVER))
+
+            client_socket.close()
 
     # ------------ FAULT TOLERANCE SERVER CRASH ------------
 
     def handle_leader_heartbeat(self):
         heartbeat_server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        heartbeat_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         heartbeat_server_socket.bind((IP_ADDRESS, HEARTBEAT_PORT_SERVER))
+
         group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
-        mreq = struct.pack('4sL', group, MULTICAST_TTL, HEARTBEAT_PORT_SERVER)
+        mreq = struct.pack('4sL', group, socket.INADDR_ANY)
         heartbeat_server_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-        while not self.lcr_ongoing and not self.shutdown_event.is_set():
-            data, addr = heartbeat_server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
-            print('received leader heartbeat')
-            if addr == self.leader_ip_address and data.decode() == 'HEARTBEAT':
-                self.last_message_from_leader_ts = time.time()
+        try:
+            while not self.lcr_ongoing and not self.shutdown_event.is_set():
+                try:
+                    data, addr = heartbeat_server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
+                    if addr[0] == self.leader_ip_address and data.decode() == 'HEARTBEAT':
+                        self.last_message_from_leader_ts = time.time()
+                except socket.error as e:
+                    print(f"Socket error: {e}")
+                except Exception as e:
+                    print(f"Error: {e}")
+        finally:
+            heartbeat_server_socket.close()
 
     def send_leader_heartbeat(self):
         while self.is_leader and not self.shutdown_event.is_set():
-            print('sending heartbeat')
             heartbeat_client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            message = 'HEARTBEAT'.encode()
-            heartbeat_client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, HEARTBEAT_PORT_SERVER))
-            time.sleep(2)
+            heartbeat_client_socket.settimeout(1)
+            try:
+                print('sending heartbeat')
+                message = 'HEARTBEAT'.encode()
+                heartbeat_client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, HEARTBEAT_PORT_SERVER))
+
+                time.sleep(2)
+            except socket.error as e:
+                print(f"Socket error: {e}")
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                heartbeat_client_socket.close()
 
     #  -------------------------------------- CLIENT LOGIC HERE --------------------------------------
 
@@ -268,77 +294,129 @@ class Server:
         listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener_socket.bind((IP_ADDRESS, BROADCAST_PORT_CLIENT))
 
-        while not self.shutdown_event.is_set():
-            if self.is_leader:
-                msg, addr = listener_socket.recvfrom(BUFFER_SIZE)
+        try:
+            while not self.shutdown_event.is_set():
+                if self.is_leader:
+                    try:
+                        listener_socket.settimeout(1)  # Timeout to periodically check shutdown_event
+                        msg, client_address = listener_socket.recvfrom(BUFFER_SIZE)
+                        print(f"Server discovery request by {client_address}")
+                        self.send_tcp_client_answer(client_address)
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"Error handling broadcast client request: {e}")
+        finally:
+            listener_socket.close()
 
-                if addr not in self.list_of_known_users:
-                    print(f"Client added with address {addr}")
-                    self.list_of_known_users.append(addr)
-                    self.send_tcp_client_answer(addr)
-                    self.send_leader_update()
-
-        listener_socket.close()
-
-    def send_tcp_client_answer(self, addr):
+    def send_tcp_client_answer(self, client_address):
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            client_socket.connect((addr, TCP_CLIENT_PORT))
+            client_socket.connect((client_address, TCP_CLIENT_PORT))
             message = "successfully connected"
             client_socket.sendall(message.encode('UTF-8'))
             data = client_socket.recv(BUFFER_SIZE)
+        except Exception as e:
+            print(f"Error connecting to client {client_address}: {e}")
         finally:
             client_socket.close()
 
     def handle_send_message_request(self):
-        listener_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener_socket.bind((IP_ADDRESS, TCP_CLIENT_PORT))
-        listener_socket.listen()
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.bind((IP_ADDRESS, TCP_CLIENT_PORT))
+        server_socket.listen()
 
         while self.is_leader:
-            client, addr = listener_socket.accept()
+            client_socket, client_addr = server_socket.accept()
 
-            while True:
-                data = json.loads(client.recv(BUFFER_SIZE).decode('UTF-8'))
-                print("received message from client", data)
-
-                if data:
-                    if data['function'] == 'create_join':
-                        if data['chatId']:
-                            if data['chatId'] in list(self.chat_rooms.keys()) and addr not in self.chat_rooms[
-                                data['chatId']]:
-                                self.chat_rooms[data['chatId']].append(addr)
-                                chat_join_message = f'New participiant {addr} joined the chat room'
-                                self.forward_message_to_chat_participants(self.find_active_chat_id(addr),
-                                                                          chat_join_message)
+            try:
+                while True:
+                    data = client_socket.recv(BUFFER_SIZE)
+                    print("received message from client", data)
+                    client_response_msg = ''
+                    if data:
+                        json_data = json.loads(data.decode('UTF-8'))
+                        if json_data['function'] == 'create_join':
+                            if json_data['chatId']:
+                                client_response_msg = self.create_or_join_chat_room(client_addr, json_data['chatId'])
                             else:
-                                self.chat_rooms[data['chatId']] = [addr]
-                            self.send_leader_update()
-                    elif data['function'] == 'chat':
-                        if data['msg']:
-                            self.forward_message_to_chat_participants(self.find_active_chat_id(addr), data['msg'])
+                                client_response_msg = "No chatId given"
+                        elif json_data['function'] == 'chat':
+                            if json_data['msg']:
+                                client_response_msg = self.send_message(client_addr, json_data['msg'])
+                            else:
+                                client_response_msg = "No message received to submit"
+                        elif json_data['function'] == 'leave':
+                            client_response_msg = self.leave_chat_room(client_addr)
+                        else:
+                            client_response_msg = "Received invalid data object"
+                        client_socket.sendall(client_response_msg.encode('UTF-8'))
+            finally:
+                client_socket.close()
 
-                    elif data['function'] == 'leave':
-                        chat_leave_message = f'Participiant {addr} is leaving'
-                        self.forward_message_to_chat_participants(self.find_active_chat_id(addr), chat_leave_message)
-                        self.send_leader_update()
+    def create_or_join_chat_room(self, client_addr, chat_room):
+        if not self.is_chat_room_assigned_already(client_addr):
+            if chat_room in self.chat_rooms:
+                self.chat_rooms[chat_room].append(client_addr)
+                chat_join_message = f'New participant {client_addr} joined the chat room'
+                self.forward_message_to_chat_participants(self.find_active_chat_id(client_addr), chat_join_message,
+                                                          "SYSTEM")
+                response = f"Successfully joined the chat room (chatId: {chat_room})"
+            else:
+                self.chat_rooms[chat_room] = [client_addr]
+                response = f"Successfully created new chat room (chatId: {chat_room})"
 
-                    else:
-                        print("data object received from client was invalid")
+            self.send_leader_update()
+            return response
+
+        return "User is already assigned to another chat room"
+
+    def leave_chat_room(self, client_addr):
+        active_chat_id = self.find_active_chat_id(client_addr)
+        if active_chat_id:
+            self.chat_rooms[active_chat_id].remove(client_addr)
+            if not self.chat_rooms[active_chat_id]:
+                self.chat_rooms.pop(active_chat_id)
+                return "Chat room has been closed as the last user left"
+
+            chat_leave_message = f'Participant {client_addr} left the chat room'
+            self.forward_message_to_chat_participants(active_chat_id, chat_leave_message, "SYSTEM")
+            self.send_leader_update()
+            return "Successfully left the chat room"
+
+        return "User is not assigned to any chat room"
+
+    def send_message(self, client_addr, message):
+        active_chat_id = self.find_active_chat_id(client_addr)
+        if active_chat_id:
+            self.forward_message_to_chat_participants(active_chat_id, message, client_addr)
+            return 'message sent'
+
+        return "Nobody here to listen - join a chat room first"
+
+    def is_chat_room_assigned_already(self, addr):
+        for user_list in self.chat_rooms.values():
+            if addr in user_list:
+                return True
+        return False
 
     def find_active_chat_id(self, addr):
         for key, value_list in self.chat_rooms.items():
             if addr in value_list:
                 return key
+        return None
 
-    def forward_message_to_chat_participants(self, chat_id, msg):
+    def forward_message_to_chat_participants(self, chat_id, msg, sender):
         client_multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         client_multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
-        send_message = msg.encode('ascii')
+        send_message = f'{sender}: {msg}'.encode('ascii')
 
-        for addr in self.chat_rooms[chat_id]:
-            client_multicast_socket.sendto(send_message, (addr, MULTICAST_PORT_CLIENT))
-
-        client_multicast_socket.close()
+        try:
+            for client_addr in self.chat_rooms[chat_id]:
+                client_multicast_socket.sendto(send_message, (client_addr, MULTICAST_PORT_CLIENT))
+        except Exception as e:
+            print(f"Error sending message to chat participants: {e}")
+        finally:
+            client_multicast_socket.close()
 
     #  -------------------------------------- EOF --------------------------------------
