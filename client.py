@@ -1,8 +1,13 @@
 import concurrent.futures
 import json
+import logging
 import socket
 import struct
 import threading
+
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # constants
 BUFFER_SIZE = 1024
@@ -27,54 +32,60 @@ class Client:
 
     # start concurrent running threads (CLI and Handling of chat messages)
     def start_client(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             self.threads.append(executor.submit(self.cli))
             self.threads.append(executor.submit(self.handle_chat_messages))
-            print('client started!')
+            logger.info('client started!')
 
             try:
                 # Keep the main thread alive while the threads are running
                 while not self.shutdown_event.is_set():
                     self.shutdown_event.wait(1)
             except KeyboardInterrupt:
-                print("Client shutdown initiated.")
+                logger.info("Client shutdown initiated.")
                 self.shutdown_event.set()
                 for thread in self.threads:
                     thread.cancel()
                 executor.shutdown(wait=True)
 
     def handle_chat_messages(self):
-        multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        multicast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        multicast_socket.bind((IP_ADDRESS, MULTICAST_PORT_CLIENT))
+        logger.info('Open socket for incoming chat messages')
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as multicast_socket:
+            multicast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            multicast_socket.bind((IP_ADDRESS, MULTICAST_PORT_CLIENT))
+            mreq = struct.pack('4sL', socket.inet_aton(MULTICAST_GROUP_ADDRESS), socket.INADDR_ANY)
+            multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
-        mreq = struct.pack('4sL', socket.inet_aton(MULTICAST_GROUP_ADDRESS), socket.INADDR_ANY)
-        multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-        while True:
-            data, addr = multicast_socket.recvfrom(BUFFER_SIZE)
-            print(f'{addr}: {data.decode("utf-8")}')
+            while not self.shutdown_event.is_set():
+                try:
+                    data, addr = multicast_socket.recvfrom(BUFFER_SIZE)
+                    print(f'{addr}: {data.decode("utf-8")}')
+                except socket.timeout as e:
+                    continue
+                except socket.error as e:
+                    logger.error(f'Socket error: {e}')
+                except Exception as e:
+                    logger.error(f'Unexpected error: {e}')
 
     # wait for answer with server_address from server and process message
     def handle_tcp_answer(self):
-        tcp_answer_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_answer_socket.bind(('', TCP_CLIENT_PORT))
-        tcp_answer_socket.listen()
-        tcp_answer_socket.settimeout(TCP_TIMEOUT)
-
-        connection, address = tcp_answer_socket.accept()
         try:
-            server_address = ''
-            while True:
-                data = connection.recv(BUFFER_SIZE)
-                if not data:
-                    break
-                server_address = data.decode('ascii')
-
-            tcp_answer_socket.close()
-            return server_address
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_answer_socket:
+                tcp_answer_socket.bind((IP_ADDRESS, TCP_CLIENT_PORT))
+                tcp_answer_socket.listen()
+                tcp_answer_socket.settimeout(TCP_TIMEOUT)
+                try:
+                    connection, address = tcp_answer_socket.accept()
+                    while True:
+                        data = connection.recv(BUFFER_SIZE)
+                        if not data:
+                            break
+                        return data.decode()
+                except Exception as e:
+                    logger.error("Exception in handle_server_answer:", e)
+                    return None
         except Exception as e:
-            print("Exception in handle_server_answer:", e)
+            logger.error("Exception in handle_server_answer:", e)
             return None
 
     #  send out broadcast message to detect currently leading server
@@ -83,12 +94,14 @@ class Client:
             broadcast_server_discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             broadcast_server_discovery_socket.sendto(IP_ADDRESS.encode('ascii'),
                                                      (BROADCAST_ADDRESS, BROADCAST_PORT_SERVER))
-            print('broadcast message sent.')
+            logger.info('Broadcast message for server discovery sent.')
             broadcast_server_discovery_socket.close()
             return self.handle_tcp_answer()
 
     def send_message_to_server(self, json_message):
-        server_address = self.find_server()
+        server_address = ''
+        while not server_address and not self.shutdown_event.is_set():
+            server_address = self.find_server()
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
         try:
@@ -96,7 +109,7 @@ class Client:
             client_socket.sendall(json_message.encode('utf-8'))
 
             data = client_socket.recv(1024)
-            print(data.decode('utf-8'))
+            logger.info(data.decode('utf-8'))
 
         finally:
             client_socket.close()
@@ -135,8 +148,7 @@ class Client:
     #  -------------------------------------- EOF --------------------------------------
 
 '''
- TODOS: user mitgeben, der die nachricht geschickt hat ( von server seite aus )
-        testing
+ TODOS: testing
         nicht senden ermöglichen, wennuser keinem chat beiwohnt
         LOCKING von ressourcen
 '''
