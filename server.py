@@ -20,18 +20,18 @@ BROADCAST_ADDRESS = '255.255.255.255'
 BROADCAST_PORT_CLIENT = 65431  # port to open to receive server discovery requests from client
 BROADCAST_PORT_SERVER = 65432  # port to open to receive and send server discovery requests
 
-TCP_SERVER_PORT = 50500  # port for incoming messages
-TCP_CLIENT_PORT = 50510  # port for outgoing messages like submit messages
+TCP_CLIENT_PORT = 50510  # port for message receiving from clients
 
 MULTICAST_PORT_CLIENT = 50550  # port for outgoing chat messages
 MULTICAST_PORT_SERVER = 50560  # port for replication of data (server)
-MULTICAST_GROUP_ADDRESS = '224.3.29.71'
+MULTICAST_GROUP_ADDRESS = '239.0.0.1'
 MULTICAST_TTL = 2
 
 LCR_PORT = 50600
-LEADER_DEATH_TIME = 20
+LEADER_DEATH_TIME = 10
 
 HEARTBEAT_PORT_SERVER = 50570  # port for incoming / outgoing heartbeat (leader)
+
 
 class Server:
     def __init__(self):
@@ -41,9 +41,11 @@ class Server:
         self.chat_rooms = {}  # dict {"<chatID>", [<client_ip_addresses>]}
         self.lcr_ongoing = False
         self.is_leader = False
-        self.last_message_from_leader_ts = 0
+        self.last_message_from_leader_ts = time.time()
         self.direct_neighbour = ''
         self.leader_ip_address = ''
+        self.lock = threading.Lock()
+        self.participant = False
 
     #  -------------------------------------- START THREADS --------------------------------------
     def start_server(self):
@@ -51,8 +53,8 @@ class Server:
             methods = [
                 self.handle_broadcast_server_requests,
                 self.lcr,
-                self.handle_tcp_server_answers,
                 self.handle_leader_update,
+                self.handle_leader_heartbeat,
                 self.detection_of_missing_or_dead_leader,
                 self.handle_broadcast_client_requests
             ]
@@ -81,37 +83,58 @@ class Server:
     #  -------------------------------------- SERVER LOGIC HERE --------------------------------------
     #  ------------ CONNECTION BETWEEN SERVERS ------------
 
-    # send broadcast hello message to other servers SENDER
     def send_broadcast_to_search_for_servers(self):
-        logger.info('Sending server discovery message via broadcast')
-        self.list_of_known_servers.clear()
-        self.list_of_known_servers.append(IP_ADDRESS)
+        logger.debug('Sending server discovery message via broadcast')
+        with self.lock:
+            self.list_of_known_servers.clear()
+            self.list_of_known_servers.append(IP_ADDRESS)
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as broadcast_server_discovery_socket:
                 broadcast_server_discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
                 msg = IP_ADDRESS.encode()
                 broadcast_server_discovery_socket.sendto(msg, (BROADCAST_ADDRESS, BROADCAST_PORT_SERVER))
+
+                broadcast_server_discovery_socket.settimeout(3)
+                while True:
+                    try:
+                        response, addr = broadcast_server_discovery_socket.recvfrom(BUFFER_SIZE)
+                        logger.debug(f'Received server discovery answer from {addr}')
+                        if addr[0] not in self.list_of_known_servers:
+                            self.list_of_known_servers.append(addr[0])
+                    except socket.timeout:
+                        logger.debug('No more responses, ending wait')
+                        break
+                    except Exception as e:
+                        logger.error(f'Error receiving response: {e}')
+                        break
         except Exception as e:
             logger.error(f'Failed to send broadcast message: {e}')
 
-    # open broadcast socket to receive hello world messages from other servers LISTENER
     def handle_broadcast_server_requests(self):
-        logger.info('Starting to listen for broadcast Server requests')
+        logger.debug('Starting to listen for broadcast server requests')
 
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener_socket:
                 listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listener_socket.bind((IP_ADDRESS, BROADCAST_PORT_SERVER))
+                listener_socket.bind(('', BROADCAST_PORT_SERVER))
+                listener_socket.settimeout(1)
 
                 while not self.shutdown_event.is_set():
                     try:
                         msg, addr = listener_socket.recvfrom(BUFFER_SIZE)
-                        logger.info('received server discovery message via broadcast')
-                        if addr not in self.list_of_known_servers:
-                            logger.info(f"Server added with address {addr}")
-                            self.list_of_known_servers.append(addr)
-                            self.send_tcp_server_answer(addr)
+                        logger.debug('Received server discovery message via broadcast')
+
+                        if addr[0] not in self.list_of_known_servers:
+                            logger.debug(f"Server added with address {addr}")
+                            self.list_of_known_servers.append(addr[0])
+
+                        response_message = 'hello'.encode()
+                        listener_socket.sendto(response_message, addr)
+                        logger.debug(f'Sent server hello to {addr}')
+
+                    except socket.timeout:
+                        continue
                     except socket.error as e:
                         logger.error(f'Socket error: {e}')
                     except Exception as e:
@@ -120,60 +143,19 @@ class Server:
         except socket.error as e:
             logger.error(f'Failed to set up listener socket: {e}')
 
-    # open tcp port for receiving answers from other servers about their existence
-    def handle_tcp_server_answers(self):
-        logger.info('Starting to listen for TCP Server answers')
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_answer_socket:
-                server_answer_socket.bind((IP_ADDRESS, TCP_SERVER_PORT))
-                server_answer_socket.listen()
-
-                while not self.shutdown_event.is_set():
-                    try:
-                        client_answer_socket, addr = server_answer_socket.accept()
-                        with client_answer_socket:
-                            logger.info('received answer to broadcast call')
-                            if addr not in self.list_of_known_servers:
-                                logger.info(f"Server added with address {addr}")
-                                self.list_of_known_servers.append(addr)
-                    except socket.error as e:
-                        logger.error(f'Socket error: {e}')
-                    except Exception as e:
-                        logger.error(f'Unexpected error: {e}')
-        except socket.error as e:
-            logger.error(f'Failed to set up TCP listener socket: {e}')
-
-    # answer to broadcast request by tcp
-    def send_tcp_server_answer(self, addr):
-        logger.info('sending own ip to broadcast requester')
-
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_answer_socket:
-                server_answer_socket.connect((addr, TCP_SERVER_PORT))
-                server_answer_socket.sendall(IP_ADDRESS.encode('ASCII'))
-                logger.info(f'Successfully sent own ip to broadcast requester')
-        except socket.error as e:
-            logger.error(f'Failed to send TCP server answer to {addr}: {e}')
-        except Exception as e:
-            logger.error(f"Unexpected error while sending TCP server answer to {addr}: {e}")
-
     # ------------ LEADER ELECTION ------------
 
     def detection_of_missing_or_dead_leader(self):
         logger.info('Starting detection of missing or dead leader')
         while not self.shutdown_event.is_set():
-            try:
-                if not self.is_leader and not self.lcr_ongoing:
-                    current_time = time.time()
-                    if (current_time - self.last_message_from_leader_ts) >= LEADER_DEATH_TIME:
-                        logger.info('No active leader detected')
-                        self.start_lcr()
-                time.sleep(1)
-            except Exception as e:
-                logger.error(f'Error during leader detection: {e}')
+            if not self.is_leader and not self.lcr_ongoing:
+                if (time.time() - self.last_message_from_leader_ts) >= LEADER_DEATH_TIME:
+                    logger.info('No active leader detected')
+                    self.start_lcr()
+            time.sleep(1)
 
     def form_ring(self):
-        logger.info('Forming ring with list of known servers')
+        logger.debug('Forming ring with list of known servers')
         try:
             binary_ring_from_server_list = sorted([socket.inet_aton(element) for element in self.list_of_known_servers])
             ip_ring = [socket.inet_ntoa(ip) for ip in binary_ring_from_server_list]
@@ -184,102 +166,103 @@ class Server:
             return []
 
     def get_direct_neighbour(self):
-        logger.info('Preparing to get direct neighbour')
+        logger.debug('Preparing to get direct neighbour')
+        self.direct_neighbour = ''
         try:
             ring = self.form_ring()
 
             if IP_ADDRESS in ring:
                 index = ring.index(IP_ADDRESS)
                 direct_neighbour = ring[(index + 1) % len(ring)]
-                if direct_neighbour != IP_ADDRESS:
+                if direct_neighbour and direct_neighbour != IP_ADDRESS:
                     self.direct_neighbour = direct_neighbour
-                logger.info(f'Direct neighbour: {self.direct_neighbour}')
+                    logger.info(f'Direct neighbour: {self.direct_neighbour}')
             else:
-                logger.warning(f'IP address {IP_ADDRESS} not in ring')
+                logger.warning(f'Ring is not complete!')
         except Exception as e:
             logger.error(f'Failed to get direct neighbour: {e}')
 
     def start_lcr(self):
         logger.info('starting leader election')
-        self.send_broadcast_to_search_for_servers()
-        time.sleep(5)
-        self.get_direct_neighbour()
+        retry = 3
+        while retry > 0:
+            self.send_broadcast_to_search_for_servers()
+            time.sleep(8)
+            self.get_direct_neighbour()
+            if not self.direct_neighbour == '':
+                break
+            retry -= 1
 
-        if self.direct_neighbour is None:
-            logger.error('no direct neighbour found')
-            return
+        if not self.direct_neighbour == '':
+            lcr_start_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                election_message = {"mid": IP_ADDRESS, "isLeader": False}
+                message = json.dumps(election_message).encode()
 
-        lcr_start_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            election_message = {"mid": IP_ADDRESS, "isLeader": False}
-            message = json.dumps(election_message).encode()
-
-            lcr_start_socket.sendto(message, (self.direct_neighbour, LCR_PORT))
-            self.lcr_ongoing = True
-            self.is_leader = False
-            logger.info(f'leader election message sent to {self.direct_neighbour}')
-        except socket.error as e:
-            logger.error('Socket error occured in start_lcr', e)
-        finally:
-            lcr_start_socket.close()
+                lcr_start_socket.sendto(message, (self.direct_neighbour, LCR_PORT))
+                with self.lock:
+                    self.lcr_ongoing = True
+                    self.is_leader = False
+                    self.participant = True
+                logger.info(f'lcr start message sent to {self.direct_neighbour}')
+            except socket.error as e:
+                logger.error('Socket error occurred in start_lcr', e)
+            finally:
+                lcr_start_socket.close()
+        else:
+            logger.warning('Assuming to be the only active server - assigning as leader')
+            with self.lock:
+                self.is_leader = True
+                self.participant = False
+                self.lcr_ongoing = False
 
     def lcr(self):
-        lcr_listener_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        lcr_listener_socket.bind((IP_ADDRESS, LCR_PORT))
-        while not self.shutdown_event.is_set():
-            participant = False
-            while not self.is_leader and self.lcr_ongoing:
-                # assuming that its the only available server which promotes itself to leader directly
-                if self.direct_neighbour == '':
-                    self.is_leader = True
-                else:
-                    data, address = lcr_listener_socket.recvfrom(BUFFER_SIZE)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as lcr_listener_socket:
+            lcr_listener_socket.bind((IP_ADDRESS, LCR_PORT))
+            while not self.shutdown_event.is_set():
+                data, address = lcr_listener_socket.recvfrom(BUFFER_SIZE)
+                with self.lock:
                     election_message = json.loads(data.decode())
-                    logger.info(f'leader election message received from {address}')
 
-                    # isLeader message received, stop LCR locally,
                     if election_message['isLeader']:
-                        participant = False
-                        lcr_listener_socket.sendto((json.dumps(election_message).encode()),
-                                                   (self.direct_neighbour, LCR_PORT))
-                        self.leader_ip_address = election_message['mid']
+                        leader_ip_address = election_message['mid']
+                        if leader_ip_address != IP_ADDRESS:
+                            logger.info(f'{IP_ADDRESS}: Leader was elected! {election_message["mid"]}')
+                            lcr_listener_socket.sendto(json.dumps(election_message).encode(),
+                                                       (self.direct_neighbour, LCR_PORT))
+                            self.leader_ip_address = leader_ip_address
+                            self.is_leader = False
+                        self.participant = False
                         self.lcr_ongoing = False
 
-                    # received lcr mid smaller, pass on own IP
-                    if election_message['mid'] < IP_ADDRESS and not participant:
-                        participant = True
-                        election_message = {"mid": IP_ADDRESS, "isLeader": False}
-                        lcr_listener_socket.sendto((json.dumps(election_message).encode()),
+                    elif election_message['mid'] < IP_ADDRESS and not self.participant:
+                        new_election_message = {"mid": IP_ADDRESS, "isLeader": False}
+                        self.participant = True
+                        lcr_listener_socket.sendto(json.dumps(new_election_message).encode(),
                                                    (self.direct_neighbour, LCR_PORT))
 
-                    # received lcr mid greater, pass on received message
                     elif election_message['mid'] > IP_ADDRESS:
-                        participant = True
-                        lcr_listener_socket.sendto((json.dumps(election_message).encode()),
+                        self.participant = True
+                        lcr_listener_socket.sendto(json.dumps(election_message).encode(),
                                                    (self.direct_neighbour, LCR_PORT))
-
-                    # received lcr mid equals own IP address, set internally as leader and send leader msg
                     elif election_message['mid'] == IP_ADDRESS:
-                        election_message = {"mid": IP_ADDRESS, "isLeader": True}
-                        participant = False
-                        lcr_listener_socket.sendto((json.dumps(election_message).encode()),
+                        new_election_message = {"mid": IP_ADDRESS, "isLeader": True}
+                        lcr_listener_socket.sendto(json.dumps(new_election_message).encode(),
                                                    (self.direct_neighbour, LCR_PORT))
                         self.leader_ip_address = IP_ADDRESS
                         self.is_leader = True
+                        self.participant = False
                         self.lcr_ongoing = False
+                        logger.info(f'Current node won leader election! {IP_ADDRESS}')
                     else:
-                        logger.warning('Unexpected event occured in lcr')
-            if self.is_leader:
-                logger.info('Current node won leader election!')
-                leader_thread = threading.Thread(target=self.send_leader_heartbeat(), args=())
-                leader_thread.start()
+                        logger.warning(f'Unexpected event occurred in LCR {election_message}')
 
     # ------------ DATA REPLICATION BETWEEN SERVERS ------------
 
     def handle_leader_update(self):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as server_socket:
-                server_socket.bind((IP_ADDRESS, MULTICAST_PORT_SERVER))
+                server_socket.bind(('', MULTICAST_PORT_SERVER))
                 group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
                 mreq = struct.pack('4sL', group, socket.INADDR_ANY)
                 server_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
@@ -288,7 +271,7 @@ class Server:
                     try:
                         if not self.is_leader:
                             data, addr = server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
-                            if addr == self.leader_ip_address:
+                            if addr[0] == self.leader_ip_address:
                                 data = json.loads(data.decode())
                                 self.chat_rooms = data.get('chat_rooms', self.chat_rooms)
                                 logger.info('Updated chat rooms according to leader server')
@@ -324,43 +307,50 @@ class Server:
     # ------------ FAULT TOLERANCE SERVER CRASH ------------
 
     def handle_leader_heartbeat(self):
-        heartbeat_server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        heartbeat_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        heartbeat_server_socket.bind((IP_ADDRESS, HEARTBEAT_PORT_SERVER))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as heartbeat_server_socket:
+            heartbeat_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            heartbeat_server_socket.bind(('', HEARTBEAT_PORT_SERVER))
 
-        group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
-        mreq = struct.pack('4sL', group, socket.INADDR_ANY)
-        heartbeat_server_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
+            mreq = struct.pack('4sL', group, socket.INADDR_ANY)
+            heartbeat_server_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            heartbeat_server_socket.settimeout(2)
 
-        try:
-            while not self.lcr_ongoing and not self.shutdown_event.is_set():
-                try:
-                    data, addr = heartbeat_server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
-                    if addr[0] == self.leader_ip_address and data.decode() == 'HEARTBEAT':
-                        self.last_message_from_leader_ts = time.time()
-                except socket.error as e:
-                    logger.error('Socket error: %s', e)
-                except Exception as e:
-                    logger.error(f"Error: {e}")
-        finally:
-            heartbeat_server_socket.close()
+            try:
+                while not self.shutdown_event.is_set():
+                    if self.is_leader:
+                        self.send_leader_heartbeat()
+                        continue
+                    try:
+                        data, addr = heartbeat_server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
+                        if data.decode() == 'HEARTBEAT':
+                            logger.info(f'Received heartbeat from leader server at {addr}')
+                            with self.lock:
+                                self.last_message_from_leader_ts = time.time()
+                    except socket.timeout:
+                        continue
+                    except socket.error as e:
+                        logger.error('Socket error occurred while receiving heartbeat: %s', e)
+                    except Exception as e:
+                        logger.error('Unexpected error occurred: %s', e)
+            finally:
+                logger.info('Shutting down heartbeat listener')
 
     def send_leader_heartbeat(self):
-        while self.is_leader and not self.shutdown_event.is_set():
-            heartbeat_client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            heartbeat_client_socket.settimeout(1)
-            try:
-                logger.info('sending heartbeat')
-                message = 'HEARTBEAT'.encode()
-                heartbeat_client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, HEARTBEAT_PORT_SERVER))
+        heartbeat_client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        heartbeat_client_socket.settimeout(1)
+        try:
+            logger.info('sending heartbeat')
+            message = 'HEARTBEAT'.encode()
+            heartbeat_client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, HEARTBEAT_PORT_SERVER))
 
-                time.sleep(2)
-            except socket.error as e:
-                logger.error(f"Socket error: {e}")
-            except Exception as e:
-                logger.error(f"Error: {e}")
-            finally:
-                heartbeat_client_socket.close()
+            time.sleep(2)
+        except socket.error as e:
+            logger.error(f"Socket error: {e}")
+        except Exception as e:
+            logger.error(f"Error: {e}")
+        finally:
+            heartbeat_client_socket.close()
 
     #  -------------------------------------- CLIENT LOGIC HERE --------------------------------------
 
@@ -368,7 +358,7 @@ class Server:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener_socket:
                 listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listener_socket.bind((IP_ADDRESS, BROADCAST_PORT_CLIENT))
+                listener_socket.bind(('', BROADCAST_PORT_CLIENT))
 
                 while not self.shutdown_event.is_set():
                     if self.is_leader:
@@ -376,26 +366,16 @@ class Server:
                             listener_socket.settimeout(1)  # Timeout to periodically check shutdown_event
                             msg, client_address = listener_socket.recvfrom(BUFFER_SIZE)
                             logger.info(f"Server discovery request by {client_address}")
-                            self.send_tcp_client_answer(client_address)
+
+                            response_message = 'hello'.encode()
+                            listener_socket.sendto(response_message, client_address)
+                            logger.debug(f'Sent server hello to client: {client_address}')
                         except socket.timeout:
                             continue
                         except Exception as e:
                             logger.error(f"Error handling broadcast client request: {e}")
         except Exception as e:
             logger.error(f"Failed to open Socket for handling client Broadcast requests: {e}")
-
-
-    def send_tcp_client_answer(self, client_address):
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            client_socket.connect((client_address, TCP_CLIENT_PORT))
-            message = "successfully connected"
-            client_socket.sendall(message.encode('UTF-8'))
-            data = client_socket.recv(BUFFER_SIZE)
-        except Exception as e:
-            logger.error(f"Error connecting to client {client_address}: {e}")
-        finally:
-            client_socket.close()
 
     def handle_send_message_request(self):
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

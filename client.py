@@ -18,11 +18,10 @@ BROADCAST_ADDRESS = '255.255.255.255'
 BROADCAST_PORT_SERVER = 65431  # dynamic discovery port on server
 
 TCP_SERVER_PORT = 50500
-TCP_CLIENT_PORT = 50510
-TCP_TIMEOUT = 5
+TCP_TIMEOUT = 3
 
 MULTICAST_PORT_CLIENT = 50550  # port for incoming chatroom messages
-MULTICAST_GROUP_ADDRESS = '224.1.2.1'
+MULTICAST_GROUP_ADDRESS = '239.0.0.2'
 
 
 class Client:
@@ -52,7 +51,7 @@ class Client:
         logger.info('Open socket for incoming chat messages')
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as multicast_socket:
             multicast_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            multicast_socket.bind((IP_ADDRESS, MULTICAST_PORT_CLIENT))
+            multicast_socket.bind(('', MULTICAST_PORT_CLIENT))
             mreq = struct.pack('4sL', socket.inet_aton(MULTICAST_GROUP_ADDRESS), socket.INADDR_ANY)
             multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
 
@@ -67,52 +66,49 @@ class Client:
                 except Exception as e:
                     logger.error(f'Unexpected error: {e}')
 
-    # wait for answer with server_address from server and process message
-    def handle_tcp_answer(self):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_answer_socket:
-                tcp_answer_socket.bind((IP_ADDRESS, TCP_CLIENT_PORT))
-                tcp_answer_socket.listen()
-                tcp_answer_socket.settimeout(TCP_TIMEOUT)
-                try:
-                    connection, address = tcp_answer_socket.accept()
-                    while True:
-                        data = connection.recv(BUFFER_SIZE)
-                        if not data:
-                            break
-                        return data.decode()
-                except Exception as e:
-                    logger.error("Exception in handle_server_answer:", e)
-                    return None
-        except Exception as e:
-            logger.error("Exception in handle_server_answer:", e)
-            return None
-
     #  send out broadcast message to detect currently leading server
     def find_server(self):
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as broadcast_server_discovery_socket:
-            broadcast_server_discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            broadcast_server_discovery_socket.sendto(IP_ADDRESS.encode('ascii'),
-                                                     (BROADCAST_ADDRESS, BROADCAST_PORT_SERVER))
-            logger.info('Broadcast message for server discovery sent.')
-            broadcast_server_discovery_socket.close()
-            return self.handle_tcp_answer()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as broadcast_server_discovery_socket:
+                broadcast_server_discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                broadcast_server_discovery_socket.sendto(IP_ADDRESS.encode('ascii'),
+                                                         (BROADCAST_ADDRESS, BROADCAST_PORT_SERVER))
+                logger.info('Broadcast message for server discovery sent.')
+
+                broadcast_server_discovery_socket.settimeout(3)
+                while True:
+                    try:
+                        response, addr = broadcast_server_discovery_socket.recv(BUFFER_SIZE)
+                        logger.debug(f'Received server answer from lead server {addr[0]}')
+                        return addr[0]
+                    except socket.timeout:
+                        break
+        except Exception as e:
+            logger.error(f'Unexpected error in find_server: {e}')
 
     def send_message_to_server(self, json_message):
         server_address = ''
-        while not server_address and not self.shutdown_event.is_set():
+        retry = 3
+        while retry > 0 and not self.shutdown_event.is_set():
             server_address = self.find_server()
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if server_address:
+                break
+            retry -= 1
 
+        logger.info(f'Proceeding to send {json_message} to server {server_address}')
         try:
-            client_socket.connect((server_address, TCP_SERVER_PORT))
-            client_socket.sendall(json_message.encode('utf-8'))
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
+                client_socket.settimeout(TCP_TIMEOUT)
+                try:
+                    client_socket.connect((server_address, TCP_SERVER_PORT))
+                    client_socket.sendall(json_message.encode('utf-8'))
 
-            data = client_socket.recv(1024)
-            logger.info(data.decode('utf-8'))
-
-        finally:
-            client_socket.close()
+                    data = client_socket.recv(1024)
+                    logger.info(data.decode('utf-8'))
+                except socket.error as e:
+                    logger.error(f'Socket error: {e}')
+        except Exception as e:
+            logger.error(f'Error in send_message_to_server: {e}')
 
     def create_or_join_chat(self):
         chat_id = input("type in the chatId of the chat you want to connect to: ")
@@ -146,9 +142,3 @@ class Client:
                 self.leave_chat()
 
     #  -------------------------------------- EOF --------------------------------------
-
-'''
- TODOS: testing
-        nicht senden ermöglichen, wennuser keinem chat beiwohnt
-        LOCKING von ressourcen
-'''
