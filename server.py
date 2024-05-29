@@ -148,11 +148,11 @@ class Server:
     def detection_of_missing_or_dead_leader(self):
         logger.info('Starting detection of missing or dead leader')
         while not self.shutdown_event.is_set():
+            time.sleep(3)
             if not self.is_leader and not self.lcr_ongoing:
                 if (time.time() - self.last_message_from_leader_ts) >= LEADER_DEATH_TIME:
                     logger.info('No active leader detected')
                     self.start_lcr()
-            time.sleep(1)
 
     def form_ring(self):
         logger.debug('Forming ring with list of known servers')
@@ -160,6 +160,7 @@ class Server:
             binary_ring_from_server_list = sorted([socket.inet_aton(element) for element in self.list_of_known_servers])
             ip_ring = [socket.inet_ntoa(ip) for ip in binary_ring_from_server_list]
             logger.info(f'Ring formed: {ip_ring}')
+
             return ip_ring
         except socket.error as e:
             logging.error(f'Failed to form ring: {e}')
@@ -203,7 +204,7 @@ class Server:
                 with self.lock:
                     self.lcr_ongoing = True
                     self.is_leader = False
-                    self.participant = True
+                    self.participant = False
                 logger.info(f'lcr start message sent to {self.direct_neighbour}')
             except socket.error as e:
                 logger.error('Socket error occurred in start_lcr', e)
@@ -242,7 +243,7 @@ class Server:
                                                    (self.direct_neighbour, LCR_PORT))
 
                     elif election_message['mid'] > IP_ADDRESS:
-                        self.participant = True
+                        self.participant = False
                         lcr_listener_socket.sendto(json.dumps(election_message).encode(),
                                                    (self.direct_neighbour, LCR_PORT))
                     elif election_message['mid'] == IP_ADDRESS:
@@ -253,7 +254,7 @@ class Server:
                         self.is_leader = True
                         self.participant = False
                         self.lcr_ongoing = False
-                        logger.info(f'Current node won leader election! {IP_ADDRESS}')
+                        logger.info(f'Current node won leader election! {IP_ADDRESS} (sent message to {self.direct_neighbour}) )')
                     else:
                         logger.warning(f'Unexpected event occurred in LCR {election_message}')
 
