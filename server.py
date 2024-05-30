@@ -56,7 +56,8 @@ class Server:
                 self.handle_leader_update,
                 self.handle_leader_heartbeat,
                 self.detection_of_missing_or_dead_leader,
-                self.handle_broadcast_client_requests
+                self.handle_broadcast_client_requests,
+                self.handle_send_message_request
             ]
 
             for method in methods:
@@ -288,18 +289,12 @@ class Server:
     def send_leader_update(self):
         if self.is_leader:
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client_socket:
-                    client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    client_socket.bind((IP_ADDRESS, MULTICAST_PORT_SERVER))
-
-                    group = socket.inet_aton(MULTICAST_GROUP_ADDRESS)
-                    mreq = struct.pack('4sL', group, socket.INADDR_ANY)
-                    client_socket.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as client_socket:
+                    client_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
 
                     message = json.dumps({"chat_rooms": self.chat_rooms}).encode()
-
                     client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, MULTICAST_PORT_SERVER))
-                    logger.info('Sent leader update for chat rooms')
+                    logger.info(f'Sent leader update for chat rooms ({self.chat_rooms})')
             except socket.error as e:
                 logger.error('Socket error occurred in send_leader_update: %s', e)
             except Exception as e:
@@ -325,7 +320,7 @@ class Server:
                     try:
                         data, addr = heartbeat_server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
                         if data.decode() == 'HEARTBEAT':
-                            logger.info(f'Received heartbeat from leader server at {addr}')
+                            logger.debug(f'Received heartbeat from leader server at {addr}')
                             with self.lock:
                                 self.last_message_from_leader_ts = time.time()
                     except socket.timeout:
@@ -341,7 +336,7 @@ class Server:
         heartbeat_client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         heartbeat_client_socket.settimeout(1)
         try:
-            logger.info('sending heartbeat')
+            logger.debug('sending heartbeat')
             message = 'HEARTBEAT'.encode()
             heartbeat_client_socket.sendto(message, (MULTICAST_GROUP_ADDRESS, HEARTBEAT_PORT_SERVER))
 
@@ -360,13 +355,13 @@ class Server:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener_socket:
                 listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener_socket.bind(('', BROADCAST_PORT_CLIENT))
+                listener_socket.settimeout(1)
 
                 while not self.shutdown_event.is_set():
                     if self.is_leader:
                         try:
-                            listener_socket.settimeout(1)  # Timeout to periodically check shutdown_event
                             msg, client_address = listener_socket.recvfrom(BUFFER_SIZE)
-                            logger.info(f"Server discovery request by {client_address}")
+                            logger.debug(f"Server discovery request by {client_address}")
 
                             response_message = 'hello'.encode()
                             listener_socket.sendto(response_message, client_address)
@@ -379,37 +374,39 @@ class Server:
             logger.error(f"Failed to open Socket for handling client Broadcast requests: {e}")
 
     def handle_send_message_request(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.bind((IP_ADDRESS, TCP_CLIENT_PORT))
-        server_socket.listen()
+        while not self.shutdown_event.is_set():
+            if self.is_leader:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
+                    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    server_socket.bind((IP_ADDRESS, TCP_CLIENT_PORT))
+                    server_socket.listen()
 
-        while self.is_leader:
-            client_socket, client_addr = server_socket.accept()
-
-            try:
-                while True:
-                    data = client_socket.recv(BUFFER_SIZE)
-                    logger.info("received message from client", data)
-                    client_response_msg = ''
-                    if data:
-                        json_data = json.loads(data.decode('UTF-8'))
-                        if json_data['function'] == 'create_join':
-                            if json_data['chatId']:
-                                client_response_msg = self.create_or_join_chat_room(client_addr, json_data['chatId'])
-                            else:
-                                client_response_msg = "No chatId given"
-                        elif json_data['function'] == 'chat':
-                            if json_data['msg']:
-                                client_response_msg = self.send_message(client_addr, json_data['msg'])
-                            else:
-                                client_response_msg = "No message received to submit"
-                        elif json_data['function'] == 'leave':
-                            client_response_msg = self.leave_chat_room(client_addr)
-                        else:
-                            client_response_msg = "Received invalid data object"
-                        client_socket.sendall(client_response_msg.encode('UTF-8'))
-            finally:
-                client_socket.close()
+                    client_socket, addr = server_socket.accept()
+                    client_addr = addr[0]
+                    with client_socket:
+                        try:
+                            data = client_socket.recv(BUFFER_SIZE)
+                            client_response_msg = ''
+                            if data:
+                                json_data = json.loads(data.decode('UTF-8'))
+                                logger.info(f"received message from client {json_data}")
+                                if json_data['function'] == 'create_join':
+                                    if json_data['chatId']:
+                                        client_response_msg = self.create_or_join_chat_room(client_addr, json_data['chatId'])
+                                    else:
+                                        client_response_msg = "No chatId given"
+                                elif json_data['function'] == 'chat':
+                                    if json_data['msg']:
+                                        client_response_msg = self.send_message(client_addr, json_data['msg'])
+                                    else:
+                                        client_response_msg = "No message received to submit"
+                                elif json_data['function'] == 'leave':
+                                    client_response_msg = self.leave_chat_room(client_addr)
+                                else:
+                                    client_response_msg = "Received invalid data object"
+                                client_socket.sendall(client_response_msg.encode('UTF-8', errors='replace'))
+                        finally:
+                            client_socket.close()
 
     def create_or_join_chat_room(self, client_addr, chat_room):
         if not self.is_chat_room_assigned_already(client_addr):
@@ -466,7 +463,7 @@ class Server:
     def forward_message_to_chat_participants(self, chat_id, msg, sender):
         client_multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         client_multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
-        send_message = f'{sender}: {msg}'.encode('ascii')
+        send_message = f'{sender}: {msg}'.encode('UTF-8')
 
         try:
             for client_addr in self.chat_rooms[chat_id]:

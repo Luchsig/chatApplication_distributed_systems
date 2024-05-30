@@ -17,7 +17,7 @@ IP_ADDRESS = socket.gethostbyname(socket.gethostname())
 BROADCAST_ADDRESS = '255.255.255.255'
 BROADCAST_PORT_SERVER = 65431  # dynamic discovery port on server
 
-TCP_SERVER_PORT = 50500
+TCP_SERVER_PORT = 50510
 TCP_TIMEOUT = 3
 
 MULTICAST_PORT_CLIENT = 50550  # port for incoming chatroom messages
@@ -71,15 +71,15 @@ class Client:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as broadcast_server_discovery_socket:
                 broadcast_server_discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                broadcast_server_discovery_socket.sendto(IP_ADDRESS.encode('ascii'),
-                                                         (BROADCAST_ADDRESS, BROADCAST_PORT_SERVER))
-                logger.info('Broadcast message for server discovery sent.')
+                msg = IP_ADDRESS.encode()
+                broadcast_server_discovery_socket.sendto(msg, (BROADCAST_ADDRESS, BROADCAST_PORT_SERVER))
+                logger.debug('Broadcast message for server discovery sent.')
 
                 broadcast_server_discovery_socket.settimeout(3)
                 while True:
                     try:
-                        response, addr = broadcast_server_discovery_socket.recv(BUFFER_SIZE)
-                        logger.debug(f'Received server answer from lead server {addr[0]}')
+                        response, addr = broadcast_server_discovery_socket.recvfrom(BUFFER_SIZE)
+                        logger.info(f'Received server answer from lead server {addr[0]}')
                         return addr[0]
                     except socket.timeout:
                         break
@@ -94,6 +94,9 @@ class Client:
             if server_address:
                 break
             retry -= 1
+            if retry == 0 and not server_address:
+                logger.error(f'Unable to connect to server. Please try again.')
+                return
 
         logger.info(f'Proceeding to send {json_message} to server {server_address}')
         try:
@@ -103,7 +106,7 @@ class Client:
                     client_socket.connect((server_address, TCP_SERVER_PORT))
                     client_socket.sendall(json_message.encode('utf-8'))
 
-                    data = client_socket.recv(1024)
+                    data = client_socket.recv(BUFFER_SIZE)
                     logger.info(data.decode('utf-8'))
                 except socket.error as e:
                     logger.error(f'Socket error: {e}')
