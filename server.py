@@ -82,7 +82,7 @@ class Server:
             logger.error(f"Error in thread {target.__name__}: {e}")
 
     #  -------------------------------------- SERVER LOGIC HERE --------------------------------------
-    #  ------------ CONNECTION BETWEEN SERVERS ------------
+    #  ------------ CONNECTION BETWEEN SERVERS ------------ broadcast
 
     def send_broadcast_to_search_for_servers(self):
         logger.debug('Sending server discovery message via broadcast')
@@ -144,7 +144,7 @@ class Server:
         except socket.error as e:
             logger.error(f'Failed to set up listener socket: {e}')
 
-    # ------------ LEADER ELECTION ------------
+    # ------------ LEADER ELECTION ------------ udp unicast
 
     def detection_of_missing_or_dead_leader(self):
         logger.info('Starting detection of missing or dead leader')
@@ -259,7 +259,7 @@ class Server:
                     else:
                         logger.warning(f'Unexpected event occurred in LCR {election_message}')
 
-    # ------------ DATA REPLICATION BETWEEN SERVERS ------------
+    # ------------ DATA REPLICATION BETWEEN SERVERS ------------ multicast
 
     def handle_leader_update(self):
         try:
@@ -300,7 +300,7 @@ class Server:
             except Exception as e:
                 logger.error('An error occurred: %s', e)
 
-    # ------------ FAULT TOLERANCE SERVER CRASH ------------
+    # ------------ FAULT TOLERANCE SERVER CRASH ------------ multicast
 
     def handle_leader_heartbeat(self):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as heartbeat_server_socket:
@@ -350,7 +350,7 @@ class Server:
 
     #  -------------------------------------- CLIENT LOGIC HERE --------------------------------------
 
-    def handle_broadcast_client_requests(self):
+    def handle_broadcast_client_requests(self): #broadcast
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener_socket:
                 listener_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -373,7 +373,7 @@ class Server:
         except Exception as e:
             logger.error(f"Failed to open Socket for handling client Broadcast requests: {e}")
 
-    def handle_send_message_request(self):
+    def handle_send_message_request(self): #tcp unicast
         while not self.shutdown_event.is_set():
             if self.is_leader:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
@@ -460,7 +460,7 @@ class Server:
                 return key
         return None
 
-    def forward_message_to_chat_participants(self, chat_id, msg, sender):
+    def forward_message_to_chat_participants(self, chat_id, msg, sender): #multicast
         client_multicast_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         client_multicast_socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
         send_message = f'{sender}: {msg}'.encode('UTF-8')

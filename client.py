@@ -67,7 +67,7 @@ class Client:
                     logger.error(f'Unexpected error: {e}')
 
     #  send out broadcast message to detect currently leading server
-    def find_server(self):
+    def find_server(self): #broadcast
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as broadcast_server_discovery_socket:
                 broadcast_server_discovery_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -86,7 +86,7 @@ class Client:
         except Exception as e:
             logger.error(f'Unexpected error in find_server: {e}')
 
-    def send_message_to_server(self, json_message):
+    def send_message_to_server(self, json_message): #tcp
         server_address = ''
         retry = 3
         while retry > 0 and not self.shutdown_event.is_set():
