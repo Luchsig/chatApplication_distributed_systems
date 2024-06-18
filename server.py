@@ -321,6 +321,8 @@ class Server:
                         data, addr = heartbeat_server_socket.recvfrom(MULTICAST_BUFFER_SIZE)
                         if data.decode() == 'HEARTBEAT':
                             logger.debug(f'Received heartbeat from leader server at {addr}')
+                            if not self.leader_ip_address:
+                                self.leader_ip_address = addr[0]
                             with self.lock:
                                 self.last_message_from_leader_ts = time.time()
                     except socket.timeout:
@@ -427,18 +429,19 @@ class Server:
 
     def leave_chat_room(self, client_addr):
         active_chat_id = self.find_active_chat_id(client_addr)
+        msg = "User is not assigned to any chat room"
         if active_chat_id:
             self.chat_rooms[active_chat_id].remove(client_addr)
-            if not self.chat_rooms[active_chat_id]:
-                self.chat_rooms.pop(active_chat_id)
-                return "Chat room has been closed as the last user left"
-
             chat_leave_message = f'Participant {client_addr} left the chat room'
             self.forward_message_to_chat_participants(active_chat_id, chat_leave_message, "SYSTEM")
             self.send_leader_update()
-            return "Successfully left the chat room"
+            msg = "Successfully left the chat room"
 
-        return "User is not assigned to any chat room"
+            if not self.chat_rooms[active_chat_id]:
+                self.chat_rooms.pop(active_chat_id)
+                msg = "Chat room has been closed as the last user left"
+
+        return msg
 
     def send_message(self, client_addr, message):
         active_chat_id = self.find_active_chat_id(client_addr)
