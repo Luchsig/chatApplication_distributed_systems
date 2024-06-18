@@ -1,0 +1,22 @@
+version: '3'
+
+services:
+  server4:
+    build:
+      context: .
+    image: server_image
+    container_name: server4
+    networks:
+      - distributed_systems_test_network
+    ports:
+      - "50513:50510"
+      - "50563:50560/udp"
+      - "50603:50600/udp"
+      - "50573:50570/udp"
+      - "65443:65431/udp"
+      - "65453:65432/udp"
+    command: python3 _server_main.py
+
+networks:
+  distributed_systems_test_network:
+    driver: bridge

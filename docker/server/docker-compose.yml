@@ -1,0 +1,54 @@
+version: '3'
+
+services:
+  server1:
+    build:
+      context: .
+    image: server_image
+    container_name: server1
+    networks:
+      - distributed_systems_test_network
+    ports:
+      - "50510:50510"
+      - "50560:50560/udp"
+      - "50600:50600/udp"
+      - "50570:50570/udp"
+      - "65440:65431/udp"
+      - "65450:65432/udp"
+    command: python3 _server_main.py
+
+  server2:
+    build:
+      context: .
+    image: server_image
+    container_name: server2
+    networks:
+      - distributed_systems_test_network
+    ports:
+      - "50511:50510"
+      - "50561:50560/udp"
+      - "50601:50600/udp"
+      - "50571:50570/udp"
+      - "65441:65431/udp"
+      - "65451:65432/udp"
+    command: python3 _server_main.py
+
+  server3:
+    build:
+      context: .
+    image: server_image
+    container_name: server3
+    networks:
+      - distributed_systems_test_network
+    ports:
+      - "50512:50510"
+      - "50562:50560/udp"
+      - "50602:50600/udp"
+      - "50572:50570/udp"
+      - "65442:65431/udp"
+      - "65452:65432/udp"
+    command: python3 _server_main.py
+
+networks:
+  distributed_systems_test_network:
+    driver: bridge
