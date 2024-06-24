@@ -6,6 +6,7 @@ import time
 import json
 import logging
 from json import JSONDecodeError
+from functions import get_ip_adress
 
 # logging
 logging.basicConfig(level=logging.INFO)
@@ -14,7 +15,8 @@ logger = logging.getLogger(__name__)
 # constants
 BUFFER_SIZE = 1024
 MULTICAST_BUFFER_SIZE = 10240
-IP_ADDRESS = socket.gethostbyname(socket.gethostname())
+# IP_ADDRESS = socket.gethostbyname(socket.gethostname())
+IP_ADDRESS = get_ip_adress()
 
 BROADCAST_ADDRESS = '255.255.255.255'
 BROADCAST_PORT_CLIENT = 65431  # port to open to receive server discovery requests from client
